@@ -39,6 +39,29 @@ export type ApiProjectDetail = {
   updatedAt: string;
 };
 
+export type ApiComment = {
+  id: string;
+  task_id: string;
+  author: ApiUser;
+  body: string;
+  created_at: string;
+};
+
+export type ActivityVerb =
+  | "task_created"
+  | "task_status_changed"
+  | "task_assignee_changed"
+  | "comment_added";
+
+export type ApiActivity = {
+  id: string;
+  verb: ActivityVerb;
+  actor: ApiUser;
+  task_id: string | null;
+  metadata: Record<string, string>;
+  created_at: string;
+};
+
 export type ExportFailure = {
   task_id: string;
   title: string;

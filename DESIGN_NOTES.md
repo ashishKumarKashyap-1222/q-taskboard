@@ -20,4 +20,17 @@ every other endpoint.
 
 ## Part 3b rollback design (activity write vs. the mutation it logs)
 
-<!-- filled in alongside the Activity Feed implementation -->
+If writing the `Activity` row fails, the change it was logging (task create, status/
+assignee update, comment post) rolls back too — each mutation and its activity write(s)
+happen inside one `transaction.atomic()` block in `backend/projects/views.py`
+(`TaskListCreateView.post`, `TaskDetailView.patch`, `CommentListCreateView.post`).
+
+Went with all-or-nothing over best-effort/fire-and-forget because the alternative means
+the audit trail can silently drift from reality - a task shows as "In Progress" but the
+feed never says who moved it there, with no error surfaced to anyone. For a feature
+whose whole job is being a trustworthy record ("the team treats comments as part of the
+engagement audit trail"), a log that can quietly go missing is worse than an action that
+occasionally fails loudly and can be retried. The two writes are cheap, same-database,
+same-request operations, so wrapping them in one transaction costs effectively nothing
+in latency or complexity - this isn't a case where the durability/availability tradeoff
+of eventual consistency actually buys anything.

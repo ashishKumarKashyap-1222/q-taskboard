@@ -94,9 +94,14 @@ changed in the database — the response body confirms it directly.
 mutation on `_can_edit_tasks(membership.role)` so viewers can't edit either (today
 `.patch` doesn't even check that a *member* isn't a mere viewer).
 
-*(Not code-fixed in this submission — Part 2 addresses only the #1-ranked issue above,
-per the assignment's "pick your highest-priority issue and fix it." Flagged here as the
-clear next fix.)*
+*(Not code-fixed as part of Part 2 — that addressed only the #1-ranked issue above, per
+the assignment's "pick your highest-priority issue and fix it." It ended up fixed
+anyway as a side effect of Part 3b: correctly attributing "who changed what" in the
+activity feed requires resolving the task's project and the actor's membership in
+`TaskDetailView.patch` regardless, so the missing check above was added at the same
+time, along with the missing `_can_edit_tasks` gate for viewers — see
+`backend/projects/views.py` `TaskDetailView.patch` and the
+`TestTaskPatchAccessControl` tests in `backend/projects/tests.py`.)*
 
 ---
 

@@ -5,8 +5,26 @@ import { apiFetch, getToken, getStoredUser } from "@/lib/api-client";
 import { Header } from "@/components/Header";
 import { StatusColumn } from "@/components/StatusColumn";
 import { TaskDetail } from "@/components/TaskDetail";
-import type { ApiProjectDetail, ApiTask, ExportResult, TaskStatus } from "@/types";
+import type { ApiActivity, ApiProjectDetail, ApiTask, ExportResult, TaskStatus } from "@/types";
 import { STATUS_ORDER } from "@/types";
+
+function describeActivity(a: ApiActivity): string {
+  const title = a.metadata.task_title;
+  switch (a.verb) {
+    case "task_created":
+      return `created "${title}"`;
+    case "task_status_changed":
+      return `moved "${title}" from ${a.metadata.from} to ${a.metadata.to}`;
+    case "task_assignee_changed":
+      return a.metadata.to
+        ? `reassigned "${title}"`
+        : `unassigned "${title}"`;
+    case "comment_added":
+      return `commented on "${title}": "${a.metadata.body_preview}"`;
+    default:
+      return a.verb;
+  }
+}
 
 export default function ProjectPage() {
   const navigate = useNavigate();
@@ -28,6 +46,11 @@ export default function ProjectPage() {
     queryFn: () => apiFetch<{ project: ApiProjectDetail }>(`/api/projects/${id}`),
   });
 
+  const { data: activityData } = useQuery({
+    queryKey: ["project", id, "activity"],
+    queryFn: () => apiFetch<{ activities: ApiActivity[] }>(`/api/projects/${id}/activity`),
+  });
+
   const createTask = useMutation({
     mutationFn: (input: { title: string; status: TaskStatus }) =>
       apiFetch<{ task: ApiTask }>(`/api/projects/${id}/tasks`, {
@@ -37,6 +60,7 @@ export default function ProjectPage() {
     onSuccess: () => {
       setNewTitle("");
       queryClient.invalidateQueries({ queryKey: ["project", id] });
+      queryClient.invalidateQueries({ queryKey: ["project", id, "activity"] });
     },
     onError: (err) => setError(err instanceof Error ? err.message : "create failed"),
   });
@@ -197,6 +221,33 @@ export default function ProjectPage() {
                     <span>{m.user.name}</span>
                     <span className="text-xs text-muted">
                       {m.user.email} · {m.role}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+
+            <section className="mt-10">
+              <h2 className="text-sm font-medium mb-3">activity</h2>
+              <ul
+                data-testid="activity-feed"
+                className="bg-surface border border-border rounded-lg divide-y divide-border"
+              >
+                {activityData?.activities.length === 0 && (
+                  <li className="px-4 py-3 text-xs text-muted italic">no activity yet</li>
+                )}
+                {activityData?.activities.map((a) => (
+                  <li
+                    key={a.id}
+                    data-testid="activity-item"
+                    className="px-4 py-3 flex items-center justify-between text-sm gap-4"
+                  >
+                    <span>
+                      <span className="font-medium">{a.actor.name}</span>{" "}
+                      <span className="text-muted">{describeActivity(a)}</span>
+                    </span>
+                    <span className="text-xs text-muted shrink-0">
+                      {new Date(a.created_at).toLocaleString()}
                     </span>
                   </li>
                 ))}

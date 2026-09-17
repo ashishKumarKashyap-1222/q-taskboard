@@ -60,3 +60,38 @@ class Task(models.Model):
     class Meta:
         db_table = 'tasks'
         indexes = [models.Index(fields=['project', 'status'])]
+
+
+class Comment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name='comments')
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='comments')
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'comments'
+        ordering = ['created_at']
+        indexes = [models.Index(fields=['task', 'created_at'])]
+
+
+class Activity(models.Model):
+    VERB_CHOICES = [
+        ('task_created', 'Task created'),
+        ('task_status_changed', 'Task status changed'),
+        ('task_assignee_changed', 'Task assignee changed'),
+        ('comment_added', 'Comment added'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='activities')
+    task = models.ForeignKey(Task, on_delete=models.SET_NULL, null=True, blank=True, related_name='activities')
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='activities')
+    verb = models.CharField(max_length=30, choices=VERB_CHOICES)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'activities'
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['project', '-created_at'])]

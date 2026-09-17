@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "@/lib/api-client";
-import type { ApiTask, ApiProjectMember, TaskStatus } from "@/types";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { apiFetch, getStoredUser } from "@/lib/api-client";
+import type { ApiComment, ApiTask, ApiProjectMember, TaskStatus } from "@/types";
 import { STATUS_LABELS, STATUS_ORDER } from "@/types";
 
 type Props = {
@@ -18,6 +18,29 @@ export function TaskDetail({ task, projectId, members, onClose }: Props) {
   const [status, setStatus] = useState<TaskStatus>(task.status);
   const [assigneeId, setAssigneeId] = useState<string>(task.assigneeId ?? "");
   const [error, setError] = useState<string | null>(null);
+  const [commentBody, setCommentBody] = useState("");
+
+  const myRole = members.find((m) => m.user.id === getStoredUser()?.id)?.role;
+  const canComment = myRole === "admin" || myRole === "member";
+
+  const { data: commentsData, isLoading: commentsLoading } = useQuery({
+    queryKey: ["task", task.id, "comments"],
+    queryFn: () => apiFetch<{ comments: ApiComment[] }>(`/api/tasks/${task.id}/comments`),
+  });
+
+  const postComment = useMutation({
+    mutationFn: (body: string) =>
+      apiFetch<{ comment: ApiComment }>(`/api/tasks/${task.id}/comments`, {
+        method: "POST",
+        body: JSON.stringify({ body }),
+      }),
+    onSuccess: () => {
+      setCommentBody("");
+      queryClient.invalidateQueries({ queryKey: ["task", task.id, "comments"] });
+      queryClient.invalidateQueries({ queryKey: ["project", projectId, "activity"] });
+    },
+    onError: (err) => setError(err instanceof Error ? err.message : "comment failed"),
+  });
 
   const updateTask = useMutation({
     mutationFn: (input: Partial<ApiTask>) =>
@@ -27,6 +50,7 @@ export function TaskDetail({ task, projectId, members, onClose }: Props) {
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["project", projectId, "activity"] });
       onClose();
     },
     onError: (err) => setError(err instanceof Error ? err.message : "save failed"),
@@ -150,6 +174,59 @@ export function TaskDetail({ task, projectId, members, onClose }: Props) {
               {updateTask.isPending ? "saving…" : "save"}
             </button>
           </div>
+        </div>
+
+        <div className="mt-6 pt-4 border-t border-border">
+          <h3 className="text-sm font-medium mb-3">comments</h3>
+
+          <div data-testid="comment-list" className="max-h-48 overflow-y-auto space-y-3 mb-3">
+            {commentsLoading && <p className="text-xs text-muted">loading…</p>}
+            {commentsData?.comments.length === 0 && (
+              <p className="text-xs text-muted italic">no comments yet</p>
+            )}
+            {commentsData?.comments.map((c) => (
+              <div key={c.id} data-testid="comment-item" className="text-sm">
+                <div className="flex items-baseline gap-2">
+                  <span className="font-medium">{c.author.name}</span>
+                  <span className="text-xs text-muted">
+                    {new Date(c.created_at).toLocaleString()}
+                  </span>
+                </div>
+                <p className="text-muted whitespace-pre-wrap">{c.body}</p>
+              </div>
+            ))}
+          </div>
+
+          {canComment ? (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!commentBody.trim()) return;
+                setError(null);
+                postComment.mutate(commentBody.trim());
+              }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                data-testid="comment-input"
+                value={commentBody}
+                onChange={(e) => setCommentBody(e.target.value)}
+                placeholder="add a comment"
+                className="flex-1 rounded-md bg-bg border border-border px-3 py-2 text-sm focus:border-accent focus:outline-none"
+              />
+              <button
+                type="submit"
+                data-testid="comment-submit"
+                disabled={postComment.isPending}
+                className="bg-accent hover:bg-indigo-500 text-white text-sm font-medium rounded-md px-4 disabled:opacity-50"
+              >
+                post
+              </button>
+            </form>
+          ) : (
+            <p className="text-xs text-muted italic">viewers can read comments but not post</p>
+          )}
         </div>
       </div>
     </div>

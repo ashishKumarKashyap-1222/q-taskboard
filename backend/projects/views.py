@@ -1,10 +1,11 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from django.db import transaction
 from django.db.models import Q
 from users.serializers import UserSerializer
-from .models import Project, Membership, Task
-from .serializers import ProjectDetailSerializer, TaskSerializer
+from .models import Project, Membership, Task, Comment, Activity
+from .serializers import ProjectDetailSerializer, TaskSerializer, CommentSerializer, ActivitySerializer
 from .airtable_client import export_tasks, AirtableConfigError
 
 
@@ -135,15 +136,23 @@ class TaskListCreateView(APIView):
         last = Task.objects.filter(project_id=project_id, status=task_status).order_by('-position').first()
         position = (last.position + 1) if last else 0
 
-        task = Task.objects.create(
-            project_id=project_id,
-            title=title,
-            description=request.data.get('description') or None,
-            status=task_status,
-            assignee_id=request.data.get('assigneeId') or None,
-            created_by=request.user,
-            position=position,
-        )
+        with transaction.atomic():
+            task = Task.objects.create(
+                project_id=project_id,
+                title=title,
+                description=request.data.get('description') or None,
+                status=task_status,
+                assignee_id=request.data.get('assigneeId') or None,
+                created_by=request.user,
+                position=position,
+            )
+            Activity.objects.create(
+                project_id=project_id,
+                task=task,
+                actor=request.user,
+                verb='task_created',
+                metadata={'task_title': task.title, 'status': task.status},
+            )
         task_data = TaskSerializer(Task.objects.select_related('assignee').get(id=task.id)).data
         return Response({'task': task_data}, status=status.HTTP_201_CREATED)
 
@@ -151,9 +160,17 @@ class TaskListCreateView(APIView):
 class TaskDetailView(APIView):
     def patch(self, request, task_id):
         try:
-            task = Task.objects.get(id=task_id)
+            task = Task.objects.select_related('project').get(id=task_id)
         except Task.DoesNotExist:
             return Response({'error': 'not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        membership = _get_membership(request.user, task.project_id)
+        if not membership:
+            return Response({'error': 'forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        if not _can_edit_tasks(membership.role):
+            return Response({'error': 'viewers cannot edit tasks'}, status=status.HTTP_403_FORBIDDEN)
+
+        pending_activities = []
 
         if 'title' in request.data:
             task.title = request.data['title'].strip()
@@ -163,10 +180,26 @@ class TaskDetailView(APIView):
             new_status = request.data['status']
             if new_status not in ('todo', 'in_progress', 'review', 'done'):
                 return Response({'error': 'invalid status'}, status=status.HTTP_400_BAD_REQUEST)
+            if new_status != task.status:
+                pending_activities.append(('task_status_changed', {'from': task.status, 'to': new_status}))
             task.status = new_status
         if 'assigneeId' in request.data:
-            task.assignee_id = request.data['assigneeId'] or None
-        task.save()
+            new_assignee_id = request.data['assigneeId'] or None
+            old_assignee_id = str(task.assignee_id) if task.assignee_id else None
+            if new_assignee_id != old_assignee_id:
+                pending_activities.append(('task_assignee_changed', {'from': old_assignee_id, 'to': new_assignee_id}))
+            task.assignee_id = new_assignee_id
+
+        with transaction.atomic():
+            task.save()
+            for verb, metadata in pending_activities:
+                Activity.objects.create(
+                    project_id=task.project_id,
+                    task=task,
+                    actor=request.user,
+                    verb=verb,
+                    metadata={**metadata, 'task_title': task.title},
+                )
 
         task_data = TaskSerializer(Task.objects.select_related('assignee').get(id=task_id)).data
         return Response({'task': task_data})
@@ -233,3 +266,70 @@ class ExportView(APIView):
             return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return Response({'exported': result['exported'], 'failed': result['failed']})
+
+
+class CommentListCreateView(APIView):
+    """Chronological, append-only comment thread on a task (Part 3a). There is
+    intentionally no PATCH/DELETE route for comments anywhere in urls.py -
+    once posted, a comment cannot be edited or removed."""
+
+    def get(self, request, task_id):
+        try:
+            task = Task.objects.get(id=task_id)
+        except Task.DoesNotExist:
+            return Response({'error': 'not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        membership = _get_membership(request.user, task.project_id)
+        if not membership:
+            return Response({'error': 'forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        comments = Comment.objects.filter(task_id=task_id).select_related('author').order_by('created_at')
+        return Response({'comments': CommentSerializer(comments, many=True).data})
+
+    def post(self, request, task_id):
+        try:
+            task = Task.objects.get(id=task_id)
+        except Task.DoesNotExist:
+            return Response({'error': 'not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        membership = _get_membership(request.user, task.project_id)
+        if not membership:
+            return Response({'error': 'forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        if not _can_edit_tasks(membership.role):
+            return Response({'error': 'viewers cannot post comments'}, status=status.HTTP_403_FORBIDDEN)
+
+        body = (request.data.get('body') or '').strip()
+        if not body:
+            return Response({'error': 'body is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            comment = Comment.objects.create(task=task, author=request.user, body=body)
+            Activity.objects.create(
+                project_id=task.project_id,
+                task=task,
+                actor=request.user,
+                verb='comment_added',
+                metadata={'task_title': task.title, 'body_preview': body[:140]},
+            )
+
+        comment = Comment.objects.select_related('author').get(id=comment.id)
+        return Response({'comment': CommentSerializer(comment).data}, status=status.HTTP_201_CREATED)
+
+
+class ActivityListView(APIView):
+    """Recent-activity feed for a project (Part 3b): members-only, newest first."""
+
+    RECENT_LIMIT = 50
+
+    def get(self, request, project_id):
+        membership = _get_membership(request.user, project_id)
+        if not membership:
+            return Response({'error': 'forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        activities = (
+            Activity.objects
+            .filter(project_id=project_id)
+            .select_related('actor', 'task')
+            .order_by('-created_at')[:self.RECENT_LIMIT]
+        )
+        return Response({'activities': ActivitySerializer(activities, many=True).data})

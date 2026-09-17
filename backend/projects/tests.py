@@ -1,7 +1,7 @@
 import pytest
 from rest_framework.test import APIClient
 from users.models import User
-from projects.models import Project, Membership, Task
+from projects.models import Project, Membership, Task, Comment
 from projects import airtable_client
 from projects.airtable_mock import MockAirtableTable
 
@@ -245,3 +245,169 @@ class TestExport:
         assert response.data['exported'] == 1
         assert response.data['failed'] == []
         assert str(task.id) in mock_table.records_by_key
+
+
+@pytest.mark.django_db
+class TestTaskPatchAccessControl:
+    """Regression tests for REVIEW.md issue #2: TaskDetailView.patch used to skip
+    the membership check entirely. Fixed as part of instrumenting PATCH for the
+    Part 3b activity feed, since correctly attributing 'who changed what' requires
+    resolving project membership anyway."""
+
+    def test_patch_requires_membership(self, client, user):
+        owner = User.objects.create_user(email='patch-owner1@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='P', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+        task = Task.objects.create(project=project, title='Original title', created_by=owner)
+
+        resp = client.post('/api/auth/login', {'email': 'meera@taskboard.dev', 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        response = client.patch(f'/api/tasks/{task.id}', {'title': 'PWNED'}, format='json')
+        assert response.status_code == 403
+        task.refresh_from_db()
+        assert task.title == 'Original title'
+
+    def test_viewers_cannot_patch_tasks(self, client, user):
+        owner = User.objects.create_user(email='patch-owner2@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='P', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+        Membership.objects.create(user=user, project=project, role='viewer')
+        task = Task.objects.create(project=project, title='Original title', created_by=owner)
+
+        resp = client.post('/api/auth/login', {'email': 'meera@taskboard.dev', 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        response = client.patch(f'/api/tasks/{task.id}', {'title': 'nope'}, format='json')
+        assert response.status_code == 403
+
+
+@pytest.mark.django_db
+class TestComments:
+    def test_comments_listed_chronologically_with_author_and_body(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        task = Task.objects.create(project=project, title='T', created_by=user)
+
+        auth_client.post(f'/api/tasks/{task.id}/comments', {'body': 'first comment'}, format='json')
+        auth_client.post(f'/api/tasks/{task.id}/comments', {'body': 'second comment'}, format='json')
+
+        response = auth_client.get(f'/api/tasks/{task.id}/comments')
+        assert response.status_code == 200
+        bodies = [c['body'] for c in response.data['comments']]
+        assert bodies == ['first comment', 'second comment']
+        first = response.data['comments'][0]
+        assert first['author']['email'] == 'meera@taskboard.dev'
+        assert 'created_at' in first
+
+    def test_viewer_can_read_but_not_post(self, client, user):
+        owner = User.objects.create_user(email='comment-owner1@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='P', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+        Membership.objects.create(user=user, project=project, role='viewer')
+        task = Task.objects.create(project=project, title='T', created_by=owner)
+        Comment.objects.create(task=task, author=owner, body='existing comment')
+
+        resp = client.post('/api/auth/login', {'email': 'meera@taskboard.dev', 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        read_response = client.get(f'/api/tasks/{task.id}/comments')
+        assert read_response.status_code == 200
+        assert len(read_response.data['comments']) == 1
+
+        post_response = client.post(f'/api/tasks/{task.id}/comments', {'body': 'trying to post'}, format='json')
+        assert post_response.status_code == 403
+
+    def test_non_member_cannot_read_or_post(self, client, user):
+        owner = User.objects.create_user(email='comment-owner2@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='P', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+        task = Task.objects.create(project=project, title='T', created_by=owner)
+
+        resp = client.post('/api/auth/login', {'email': 'meera@taskboard.dev', 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        assert client.get(f'/api/tasks/{task.id}/comments').status_code == 403
+        assert client.post(f'/api/tasks/{task.id}/comments', {'body': 'x'}, format='json').status_code == 403
+
+    def test_comments_have_no_edit_or_delete_route(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        task = Task.objects.create(project=project, title='T', created_by=user)
+        auth_client.post(f'/api/tasks/{task.id}/comments', {'body': 'immutable'}, format='json')
+
+        # there is no per-comment URL at all - PATCH/DELETE on the collection
+        # endpoint itself is simply not a route DRF recognizes.
+        assert auth_client.patch(f'/api/tasks/{task.id}/comments', {'body': 'edited'}, format='json').status_code == 405
+        assert auth_client.delete(f'/api/tasks/{task.id}/comments').status_code == 405
+
+
+@pytest.mark.django_db
+class TestActivity:
+    def test_task_created_writes_activity(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+
+        auth_client.post(f'/api/projects/{project.id}/tasks', {'title': 'New task'}, format='json')
+
+        response = auth_client.get(f'/api/projects/{project.id}/activity')
+        assert response.status_code == 200
+        verbs = [a['verb'] for a in response.data['activities']]
+        assert 'task_created' in verbs
+
+    def test_status_and_assignee_changes_write_activity(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        other = User.objects.create_user(email='assignee@example.com', name='Assignee', password='password123')
+        Membership.objects.create(user=other, project=project, role='member')
+        task = Task.objects.create(project=project, title='T', status='todo', created_by=user)
+
+        auth_client.patch(f'/api/tasks/{task.id}', {'status': 'in_progress', 'assigneeId': str(other.id)}, format='json')
+
+        response = auth_client.get(f'/api/projects/{project.id}/activity')
+        by_verb = {a['verb']: a for a in response.data['activities']}
+        assert by_verb['task_status_changed']['metadata'] == {'from': 'todo', 'to': 'in_progress', 'task_title': 'T'}
+        assert by_verb['task_assignee_changed']['metadata']['to'] == str(other.id)
+
+    def test_no_op_patch_does_not_create_spurious_activity(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        task = Task.objects.create(project=project, title='T', status='todo', created_by=user)
+
+        auth_client.patch(f'/api/tasks/{task.id}', {'status': 'todo', 'title': 'T'}, format='json')
+
+        response = auth_client.get(f'/api/projects/{project.id}/activity')
+        assert response.data['activities'] == []
+
+    def test_comment_added_writes_activity(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        task = Task.objects.create(project=project, title='T', created_by=user)
+
+        auth_client.post(f'/api/tasks/{task.id}/comments', {'body': 'hello'}, format='json')
+
+        response = auth_client.get(f'/api/projects/{project.id}/activity')
+        verbs = [a['verb'] for a in response.data['activities']]
+        assert 'comment_added' in verbs
+
+    def test_activity_ordered_most_recent_first(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+
+        auth_client.post(f'/api/projects/{project.id}/tasks', {'title': 'First task'}, format='json')
+        auth_client.post(f'/api/projects/{project.id}/tasks', {'title': 'Second task'}, format='json')
+
+        response = auth_client.get(f'/api/projects/{project.id}/activity')
+        titles = [a['metadata']['task_title'] for a in response.data['activities']]
+        assert titles == ['Second task', 'First task']
+
+    def test_activity_requires_membership(self, client, user):
+        owner = User.objects.create_user(email='activity-owner@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='P', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+
+        resp = client.post('/api/auth/login', {'email': 'meera@taskboard.dev', 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        response = client.get(f'/api/projects/{project.id}/activity')
+        assert response.status_code == 403
