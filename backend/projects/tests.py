@@ -2,6 +2,8 @@ import pytest
 from rest_framework.test import APIClient
 from users.models import User
 from projects.models import Project, Membership, Task
+from projects import airtable_client
+from projects.airtable_mock import MockAirtableTable
 
 
 @pytest.fixture
@@ -139,3 +141,107 @@ class TestTasks:
         response = auth_client.get(f"/api/projects/{project.id}/tasks", {'q': "O'Brien"})
         assert response.status_code == 200
         assert response.data['tasks'][0]['title'] == "Fix O'Brien's report"
+
+
+def _use_mock_table(monkeypatch, mock_table):
+    """Point ExportView at a fake Airtable table instead of the real API."""
+    monkeypatch.setattr(
+        'projects.views.export_tasks',
+        lambda tasks: airtable_client.export_tasks(tasks, table=mock_table),
+    )
+
+
+@pytest.mark.django_db
+class TestExport:
+    def test_export_requires_membership(self, client, user):
+        owner = User.objects.create_user(email='export-owner1@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='P', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+
+        resp = client.post('/api/auth/login', {'email': 'meera@taskboard.dev', 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        response = client.post(f'/api/projects/{project.id}/export')
+        assert response.status_code == 403
+
+    def test_viewers_cannot_export(self, client, user):
+        owner = User.objects.create_user(email='export-owner2@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='P', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+        Membership.objects.create(user=user, project=project, role='viewer')
+
+        resp = client.post('/api/auth/login', {'email': 'meera@taskboard.dev', 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        response = client.post(f'/api/projects/{project.id}/export')
+        assert response.status_code == 403
+
+    def test_members_can_export(self, client, user, monkeypatch):
+        owner = User.objects.create_user(email='export-owner3@example.com', name='Owner', password='password123')
+        project = Project.objects.create(name='P', owner=owner)
+        Membership.objects.create(user=owner, project=project, role='admin')
+        Membership.objects.create(user=user, project=project, role='member')
+        Task.objects.create(project=project, title='T', created_by=owner)
+
+        # never hit the real Airtable API from tests - this test only cares that
+        # a member gets past the permission check (not blocked at 403).
+        _use_mock_table(monkeypatch, MockAirtableTable())
+
+        resp = client.post('/api/auth/login', {'email': 'meera@taskboard.dev', 'password': 'password123'}, format='json')
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['token']}")
+
+        response = client.post(f'/api/projects/{project.id}/export')
+        assert response.status_code != 403
+
+    def test_export_pushes_tasks_and_reruns_are_idempotent(self, auth_client, user, monkeypatch):
+        project = Project.objects.create(name='Export Proj', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        Task.objects.create(project=project, title='Task One', created_by=user)
+        Task.objects.create(project=project, title='Task Two', created_by=user)
+
+        mock_table = MockAirtableTable()
+        _use_mock_table(monkeypatch, mock_table)
+
+        response = auth_client.post(f'/api/projects/{project.id}/export')
+        assert response.status_code == 200
+        assert response.data['exported'] == 2
+        assert response.data['failed'] == []
+        assert len(mock_table.records_by_key) == 2
+
+        # re-running the export must update the same two rows, not duplicate them
+        response2 = auth_client.post(f'/api/projects/{project.id}/export')
+        assert response2.status_code == 200
+        assert response2.data['exported'] == 2
+        assert len(mock_table.records_by_key) == 2
+
+    def test_export_skips_bad_record_without_failing_the_batch(self, auth_client, user, monkeypatch):
+        project = Project.objects.create(name='Export Proj 2', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        good = Task.objects.create(project=project, title='Good task', created_by=user)
+        bad = Task.objects.create(project=project, title='Bad task', created_by=user)
+
+        mock_table = MockAirtableTable(fail_task_ids={str(bad.id)})
+        _use_mock_table(monkeypatch, mock_table)
+
+        response = auth_client.post(f'/api/projects/{project.id}/export')
+        assert response.status_code == 200
+        assert response.data['exported'] == 1
+        assert len(response.data['failed']) == 1
+        assert response.data['failed'][0]['task_id'] == str(bad.id)
+        assert str(good.id) in mock_table.records_by_key
+        assert str(bad.id) not in mock_table.records_by_key
+
+    def test_export_retries_transient_failure_then_succeeds(self, auth_client, user, monkeypatch):
+        project = Project.objects.create(name='Export Proj 3', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        task = Task.objects.create(project=project, title='Task', created_by=user)
+
+        monkeypatch.setattr(airtable_client.time, 'sleep', lambda seconds: None)
+        mock_table = MockAirtableTable(transient_failures=2)  # fails twice, succeeds on the 3rd (final allowed) attempt
+        _use_mock_table(monkeypatch, mock_table)
+
+        response = auth_client.post(f'/api/projects/{project.id}/export')
+        assert response.status_code == 200
+        assert response.data['exported'] == 1
+        assert response.data['failed'] == []
+        assert str(task.id) in mock_table.records_by_key
