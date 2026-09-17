@@ -1,7 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from django.db import connection
+from django.db.models import Q
 from users.serializers import UserSerializer
 from .models import Project, Membership, Task
 from .serializers import ProjectDetailSerializer, TaskSerializer
@@ -107,27 +107,13 @@ class TaskListCreateView(APIView):
         if not membership:
             return Response({'error': 'forbidden'}, status=status.HTTP_403_FORBIDDEN)
 
+        tasks = Task.objects.filter(project_id=project_id).select_related('assignee')
+
         q = request.query_params.get('q')
         if q:
-            with connection.cursor() as cursor:
-                sql = (
-                    f"SELECT id, project_id, title, description, status, assignee_id, created_by_id, position, created_at, updated_at "
-                    f"FROM tasks "
-                    f"WHERE project_id = '{project_id}' "
-                    f"AND (title ILIKE '%{q}%' OR description ILIKE '%{q}%') "
-                    f"ORDER BY position ASC"
-                )
-                cursor.execute(sql)
-                columns = [col[0] for col in cursor.description]
-                rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-            return Response({'tasks': rows})
+            tasks = tasks.filter(Q(title__icontains=q) | Q(description__icontains=q))
 
-        tasks = (
-            Task.objects
-            .filter(project_id=project_id)
-            .select_related('assignee')
-            .order_by('status', 'position')
-        )
+        tasks = tasks.order_by('status', 'position')
         return Response({'tasks': TaskSerializer(tasks, many=True).data})
 
     def post(self, request, project_id):

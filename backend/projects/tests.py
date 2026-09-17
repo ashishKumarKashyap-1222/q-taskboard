@@ -97,3 +97,45 @@ class TestTasks:
 
         response = client.delete(f'/api/tasks/{task.id}')
         assert response.status_code == 403
+
+    def test_search_matches_title_or_description(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        Task.objects.create(project=project, title='Finalize launch date', created_by=user)
+        Task.objects.create(project=project, title='Unrelated task', description='mentions launch here', created_by=user)
+        Task.objects.create(project=project, title='Something else entirely', created_by=user)
+
+        response = auth_client.get(f'/api/projects/{project.id}/tasks?q=launch')
+        assert response.status_code == 200
+        titles = {t['title'] for t in response.data['tasks']}
+        assert titles == {'Finalize launch date', 'Unrelated task'}
+
+    def test_search_does_not_leak_tasks_from_other_projects(self, auth_client, user):
+        my_project = Project.objects.create(name='Mine', owner=user)
+        Membership.objects.create(user=user, project=my_project, role='admin')
+        Task.objects.create(project=my_project, title='My only task', created_by=user)
+
+        other_owner = User.objects.create_user(email='other-owner@example.com', name='Other', password='password123')
+        other_project = Project.objects.create(name='Not Mine', owner=other_owner)
+        Membership.objects.create(user=other_owner, project=other_project, role='admin')
+        Task.objects.create(project=other_project, title='Secret task from another project', created_by=other_owner)
+
+        # regression test for the SQL injection fixed in views.py: a query designed to break
+        # out of the old raw-SQL WHERE clause and match every row must NOT leak other projects'
+        # tasks, and must not raise a server error either.
+        payload = "nonexistent%') OR 1=1 -- "
+        response = auth_client.get(f'/api/projects/{my_project.id}/tasks', {'q': payload})
+        assert response.status_code == 200
+        titles = {t['title'] for t in response.data['tasks']}
+        assert titles == set()
+        assert 'Secret task from another project' not in titles
+        assert 'My only task' not in titles  # payload matches nothing literally, by design
+
+    def test_search_handles_sql_special_characters_safely(self, auth_client, user):
+        project = Project.objects.create(name='P', owner=user)
+        Membership.objects.create(user=user, project=project, role='admin')
+        Task.objects.create(project=project, title="Fix O'Brien's report", created_by=user)
+
+        response = auth_client.get(f"/api/projects/{project.id}/tasks", {'q': "O'Brien"})
+        assert response.status_code == 200
+        assert response.data['tasks'][0]['title'] == "Fix O'Brien's report"
