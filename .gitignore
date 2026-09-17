@@ -22,5 +22,12 @@ build/
 .vscode/
 .idea/
 
+# AI coding tool local working dirs (session/config data, not project source).
+# NOTE: this does NOT affect .ai-conversations/ below — the pre-commit hook copies
+# captured conversation content there regardless of these dirs' tracked status.
+.claude/
+.cursor/
+.aider*
+
 # AI conversations captured by pre-commit hook
 # (intentionally not ignored — they are part of the evaluation)
